@@ -1,0 +1,39 @@
+#!/bin/sh /etc/rc.common
+# Copyright (C) 2012-2014 OpenWrt.org
+
+START=99
+
+USE_PROCD=1
+PROG="/usr/sbin/stun-client"
+
+start_service() {
+	config_load easycwmp
+	config_get stun_enable local stun_enable 0
+	config_get stun_address local stun_address
+	config_get stun_port local stun_port 3478
+	if [ $stun_enable -eq 0 ]; then
+		exit 0
+	fi
+	
+	if [ "$stun_address" == "" ]; then
+		exit 0
+	fi
+
+	if [ ! -f $PROG ]; then
+		exit 0
+	fi
+	rm -f /tmp/stun_ucra 2> /dev/null
+
+	procd_open_instance
+	procd_set_param command "$PROG" $stun_address:$stun_port -tr111
+	procd_set_param respawn "3" "7" "0"
+	procd_close_instance
+}
+
+boot() {
+:
+}
+
+stop_service() {
+	rm -f /tmp/stun_ucra 2> /dev/null
+}

@@ -1,0 +1,240 @@
+--- stund.orig/client.cxx	Thu Jan 26 19:02:46 2012
++++ stund/client.cxx	Wed Sep 25 22:24:51 2019
+@@ -11,6 +11,7 @@
+ #include <unistd.h>
+ #include <netinet/in.h>
+ #include <errno.h>
++#include <signal.h>
+ #endif
+ 
+ #include "udp.h"
+@@ -23,7 +24,7 @@
+ usage()
+ {
+    cerr << "Usage:" << endl
+-	<< "    ./client stunServerHostname [testNumber] [-v] [-p srcPort] [-i nicAddr1] [-i nicAddr2] [-i nicAddr3]" << endl
++	<< "    ./client stunServerHostname [testNumber] [-v] [-tr111] [-p srcPort] [-i nicAddr1] [-i nicAddr2] [-i nicAddr3]" << endl
+ 	<< "For example, if the STUN server was larry.gloo.net, you could do:" << endl
+ 	<< "    ./client larry.gloo.net" << endl
+ 	<< "The testNumber is just used for special tests." << endl
+@@ -34,6 +35,17 @@
+ 
+ #define MAX_NIC 3
+ 
++bool client_daemon = false;
++int pipefd[2];
++
++void handle_sigint(int sig) 
++{
++   char buf;
++   client_daemon = false;
++   write(pipefd[1],&buf,1);
++   cout << "Caught signal" << sig << endl;
++} 
++
+ int
+ main(int argc, char* argv[])
+ {
+@@ -69,6 +81,10 @@
+       {
+          verbose = true;
+       }
++      else if ( !strcmp( argv[arg] , "-tr111" ) )
++      {
++         client_daemon = true;
++      }
+       else if ( !strcmp( argv[arg] , "-i" ) )
+       {
+          arg++;
+@@ -115,7 +131,7 @@
+               usage();
+               exit(-1);
+            }
+-	}	
++        }	
+       }
+    }
+ 
+@@ -129,7 +145,172 @@
+       // use default 
+       numNic = 1;
+    }
+-   
++
++   if (client_daemon)
++   {
++      signal(SIGTERM, handle_sigint);
++      signal(SIGKILL, handle_sigint);
++      signal(SIGHUP, handle_sigint);
++      signal(SIGINT, handle_sigint);
++      char syscmd[256] = {0};
++      sAddr[0].port=srcPort;
++      pipe(pipefd);
++      Socket myFd = openPort(srcPort,sAddr[0].addr,verbose);
++    
++      StunMessage req;
++      memset(&req, 0, sizeof(StunMessage));
++
++      char msg[STUN_MAX_MESSAGE_SIZE];
++      int msgLen = sizeof(msg);
++      StunAddress4 from;
++      bool ret = false;
++
++      StunAtrString username;
++      StunAtrString password;
++      username.sizeValue = 0;
++      password.sizeValue = 0;
++    
++      stunBuildReqSimple( &req, username, 
++                          false , false , 
++                          0x0c );
++    
++      char buf[STUN_MAX_MESSAGE_SIZE];
++      int len = STUN_MAX_MESSAGE_SIZE;
++    
++      len = stunEncodeMessage( req, buf, len, password,verbose );
++
++      if ( verbose )
++      {
++         cout << "About to send msg of len " << len 
++              << " to " << stunServerAddr << endl;
++      }
++      sendMessage( myFd,
++                buf, len, 
++                stunServerAddr.addr, 
++                stunServerAddr.port,verbose );
++
++      ret = getMessage( myFd, msg, &msgLen, &from.addr, &from.port,verbose );
++      if ( ret == true )
++      {
++         StunMessage resp;
++         memset(&resp, 0, sizeof(StunMessage));
++
++         bool ok = stunParseMessage( msg, msgLen, resp,verbose );
++         if (ok)
++         {
++            Socket s = openPort( 0, resp.mappedAddress.ipv4.addr, false );
++            if ( s != INVALID_SOCKET )
++            {
++               closesocket(s);
++               if ( verbose )
++               {
++                  cout << "not in NAT" << endl;
++               }
++               system ( "echo 0 > /tmp/stun_natdetected" );
++            }
++            else
++            {
++            //udp connection request address update
++               if ( verbose )
++               {
++                  cout << "udp connection request address update:" << resp.mappedAddress.ipv4 << endl;
++               }
++               system ( "echo 1 > /tmp/stun_natdetected" );
++               system ( "ubus call tr069 notify" );
++               sprintf ( syscmd, "echo %d.%d.%d.%d:%d > /tmp/stun_ucra", 
++                             ((int)(resp.mappedAddress.ipv4.addr>>24)&0xFF), 
++                             ((int)(resp.mappedAddress.ipv4.addr>>16)&0xFF),
++                             ((int)(resp.mappedAddress.ipv4.addr>> 8)&0xFF),
++                             ((int)(resp.mappedAddress.ipv4.addr>> 0)&0xFF),
++                              resp.mappedAddress.ipv4.port );
++               system (syscmd);
++               system ( "ubus call tr069 notify" );
++            }
++         }
++      }
++
++      fd_set rset;
++      struct timeval tv;
++      int maxfdp1 = max(myFd, pipefd[0])+1;
++      while (client_daemon)
++      {
++         FD_ZERO(&rset);
++         FD_SET(myFd, &rset);
++         FD_SET(pipefd[0], &rset);
++       	 tv.tv_sec = 60;
++
++         // select the ready descriptor 
++         int nready = select(maxfdp1, &rset, NULL, NULL, &tv);
++
++         if (nready == 0)
++         {
++            if ( verbose )
++            {
++               cout << "About to send msg of len " << len 
++                    << " to " << stunServerAddr << endl;
++            }
++            sendMessage( myFd,
++                      buf, len, 
++                      stunServerAddr.addr, 
++                      stunServerAddr.port,verbose );
++                      
++            msgLen = sizeof(msg);
++            ret = getMessage( myFd, msg, &msgLen, &from.addr, &from.port,verbose );
++            if ( ret == true )
++            {
++               StunMessage resp;
++               memset(&resp, 0, sizeof(StunMessage));
++
++               bool ok = stunParseMessage( msg, msgLen, resp,verbose );
++               if (ok)
++               {
++                  Socket s = openPort( 0, resp.mappedAddress.ipv4.addr, false );
++                  if ( s != INVALID_SOCKET )
++                  {
++                     closesocket(s);
++                     if ( verbose )
++                     {
++                        cout << "not in NAT" << endl;
++                     }
++                     system ( "echo 0 > /tmp/stun_natdetected" );
++                  }
++                  else
++                  {
++                     //udp connection request address update
++                     if ( verbose )
++                     {
++                        cout << "udp connection request address update" << endl;
++                     }
++                     system ( "echo 1 > /tmp/stun_natdetected" );
++                     system ( "ubus call tr069 notify" );
++                     sprintf ( syscmd, "echo %d.%d.%d.%d:%d > /tmp/stun_ucra", 
++                             ((int)(resp.mappedAddress.ipv4.addr>>24)&0xFF), 
++                             ((int)(resp.mappedAddress.ipv4.addr>>16)&0xFF),
++                             ((int)(resp.mappedAddress.ipv4.addr>> 8)&0xFF),
++                             ((int)(resp.mappedAddress.ipv4.addr>> 0)&0xFF),
++                              resp.mappedAddress.ipv4.port );
++                     system (syscmd);
++                     system ( "ubus call tr069 notify" );
++                  }
++
++                  continue;
++               }
++            }
++         }
++         if ( nready >= 0 ) {
++            getMessage( myFd, msg, &msgLen, &from.addr, &from.port,verbose );
++            if ( verbose )
++            {
++               cout << "connection request" << endl;
++            }
++            system ( "ubus call tr069 inform \'{\"event\":\"6 CONNECTION REQUEST\"}\'" );
++         }
++      }
++      closesocket(myFd);
++      closesocket(pipefd[0]);
++      closesocket(pipefd[1]);
++   }
++   else
+    for ( int nic=0; nic<numNic; nic++ )
+    {
+       sAddr[nic].port=srcPort;
+@@ -138,7 +319,7 @@
+          usage();
+          exit(-1);
+       }
+-   
++
+       if (testNum==0)
+       {
+          bool presPort=false;
